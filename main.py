@@ -10,7 +10,7 @@ from typing import Optional, List
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 from stripe_routes import router as stripe_router
 from affiliate import rewrite_results
 
