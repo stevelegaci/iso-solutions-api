@@ -12,7 +12,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from duckduckgo_search import DDGS
 from stripe_routes import router as stripe_router
+from affiliate import rewrite_results
 
+# ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="ISO Solutions API", version="1.0.0")
 
 ALLOWED_ORIGINS = os.getenv(
@@ -22,7 +24,7 @@ ALLOWED_ORIGINS = os.getenv(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],           # tightened per-env via ALLOWED_ORIGINS in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,6 +32,8 @@ app.add_middleware(
 
 app.include_router(stripe_router)
 
+# ── Database ──────────────────────────────────────────────────────────────────
+# Railway mounts a persistent volume at /data when configured; fall back to /tmp
 _data_dir = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "/tmp")
 DB_PATH = os.getenv("DATABASE_URL", os.path.join(_data_dir, "iso.db"))
 
@@ -70,6 +74,7 @@ def init_db():
             created_at TEXT
         );
     """)
+    # Seed demo members only on fresh DB
     existing = conn.execute("SELECT COUNT(*) FROM members").fetchone()[0]
     if existing == 0:
         demo = [
@@ -89,6 +94,7 @@ def init_db():
 
 init_db()
 
+# ── Pydantic Models ───────────────────────────────────────────────────────────
 class IntentPayload(BaseModel):
     raw_text: str
     urgency_score: float = 0.5
@@ -105,6 +111,7 @@ class MemberCreate(BaseModel):
     email: str
     plan: str = "free"
 
+# ── Agent 1: Signal Agent ─────────────────────────────────────────────────────
 @app.post("/v1/intent/ingest")
 async def ingest_intent(payload: IntentPayload, background_tasks: BackgroundTasks):
     intent_id = f"int_{uuid.uuid4().hex[:8]}"
@@ -120,6 +127,7 @@ async def ingest_intent(payload: IntentPayload, background_tasks: BackgroundTask
     background_tasks.add_task(run_agent_pipeline, intent_id, payload.raw_text, payload.budgets)
     return {"intent_id": intent_id, "status": "queued"}
 
+# ── Agent 2: Intent Agent ─────────────────────────────────────────────────────
 def classify_intent(text: str) -> dict:
     text_lower = text.lower()
     urgency_words = ["asap","urgent","desperately","need now","immediately","today",
@@ -146,6 +154,7 @@ def classify_intent(text: str) -> dict:
         "max_budget": float(budgets[-1].replace("$", "")) if budgets else None,
     }
 
+# ── Agent 3: Sourcing Agent ───────────────────────────────────────────────────
 def search_products(query: str, max_results: int = 5) -> List[dict]:
     results = []
     try:
@@ -183,6 +192,7 @@ def search_products(query: str, max_results: int = 5) -> List[dict]:
             pass
     return results
 
+# ── Agent 4: Ranking Agent ────────────────────────────────────────────────────
 def rank_results(results: List[dict], budget: Optional[float] = None) -> List[dict]:
     known = ["amazon.com", "ebay.com", "walmart.com", "bestbuy.com", "etsy.com", "target.com"]
 
@@ -202,6 +212,7 @@ def rank_results(results: List[dict], budget: Optional[float] = None) -> List[di
         r["rank"] = i + 1
     return scored
 
+# ── Agent 5: Response Agent ───────────────────────────────────────────────────
 def build_recommendation(intent_id: str, ranked: List[dict], item: str) -> dict:
     rec_id = f"rec_{uuid.uuid4().hex[:8]}"
     best   = ranked[0] if ranked else None
@@ -224,6 +235,7 @@ def build_recommendation(intent_id: str, ranked: List[dict], item: str) -> dict:
     conn.close()
     return rec
 
+# ── Full Pipeline ─────────────────────────────────────────────────────────────
 async def run_agent_pipeline(intent_id: str, text: str, budgets: list):
     conn = get_db()
     conn.execute("UPDATE intents SET status='processing' WHERE id=?", (intent_id,))
@@ -231,13 +243,14 @@ async def run_agent_pipeline(intent_id: str, text: str, budgets: list):
     conn.close()
     classified = classify_intent(text)
     results    = search_products(classified["item"], max_results=6)
-    ranked     = rank_results(results, classified.get("max_budget"))
+    ranked     = rewrite_results(rank_results(results, classified.get("max_budget")))
     build_recommendation(intent_id, ranked, classified["item"])
 
+# ── REST Endpoints ────────────────────────────────────────────────────────────
 @app.post("/v1/match/find")
 async def find_match(req: MatchRequest):
     results = search_products(req.query, max_results=6)
-    ranked  = rank_results(results, req.budget)
+    ranked  = rewrite_results(rank_results(results, req.budget))
     return {"query": req.query, "results": ranked,
             "best_option": ranked[0] if ranked else None, "total_found": len(ranked)}
 
@@ -333,6 +346,7 @@ async def health():
     return {"status": "ok", "version": "1.0.0", "service": "ISO Solutions API",
             "env": os.getenv("RAILWAY_ENVIRONMENT", "local")}
 
+# ── Seed demo intents on first run ────────────────────────────────────────────
 @app.on_event("startup")
 async def seed_demo():
     conn = get_db()
